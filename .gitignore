@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+venv/
+results/bot.log
+results/risk_state.json
+results/trades.csv
