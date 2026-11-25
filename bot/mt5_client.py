@@ -37,6 +37,7 @@ class SymbolSpec:
     stops_level: int
     filling_mode: int
     trade_mode: int = mt5.SYMBOL_TRADE_MODE_FULL
+    freeze_level: int = 0
 
 
 def timeframe_info(tf_name: str):
@@ -56,7 +57,10 @@ def round_lot(volume: float, spec: SymbolSpec) -> float:
 def compute_lot(spec: SymbolSpec, raw_qty: float, fixed_lot: float = 0.0, allow_min_lot: bool = True) -> float:
     """Hitung lot MT5 yang valid dari ukuran posisi RiskGuard atau fixed_lot."""
     if fixed_lot and fixed_lot > 0:
-        return max(round_lot(fixed_lot, spec), spec.volume_min)
+        lot = round_lot(fixed_lot, spec)
+        if lot < spec.volume_min:
+            return spec.volume_min if allow_min_lot else 0.0
+        return lot
 
     contract = spec.contract_size if spec.contract_size > 0 else 1.0
     target = raw_qty / contract
@@ -82,6 +86,18 @@ def filling_candidates(spec: SymbolSpec) -> list[int]:
         if m not in modes:
             modes.append(m)
     return modes
+
+
+def _validate_tick_dict(tick_data: dict, symbol: str) -> dict:
+    try:
+        bid = float(tick_data["bid"])
+        ask = float(tick_data["ask"])
+        timestamp = int(tick_data["time"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise MT5Error(f"Quote untuk order '{symbol}' tidak valid: {e}") from e
+    if bid <= 0 or ask <= 0 or ask < bid or timestamp <= 0:
+        raise MT5Error(f"Quote untuk order '{symbol}' tidak valid.")
+    return {"bid": bid, "ask": ask, "time": timestamp}
 
 
 class MT5Client:
@@ -152,7 +168,7 @@ class MT5Client:
             raise MT5Error(f"Simbol '{symbol}' tidak ditemukan di MT5.{hint}")
         if not info.visible and not mt5.symbol_select(symbol, True):
             raise MT5Error(f"Gagal menampilkan simbol '{symbol}' di Market Watch.")
-        return SymbolSpec(
+        spec = SymbolSpec(
             name=info.name,
             digits=int(info.digits),
             point=float(info.point),
@@ -163,12 +179,24 @@ class MT5Client:
             stops_level=int(info.trade_stops_level),
             filling_mode=int(info.filling_mode),
             trade_mode=int(getattr(info, "trade_mode", mt5.SYMBOL_TRADE_MODE_FULL)),
+            freeze_level=int(getattr(info, "trade_freeze_level", 0)),
         )
+        if (
+            spec.digits < 0 or spec.point <= 0 or spec.contract_size <= 0
+            or spec.volume_min <= 0 or spec.volume_step <= 0
+            or spec.volume_max < spec.volume_min
+        ):
+            raise MT5Error(f"Spesifikasi trading simbol '{symbol}' tidak valid.")
+        return spec
 
     def tick(self, symbol: str) -> dict:
         t = mt5.symbol_info_tick(symbol)
-        if t is None or (t.bid <= 0 and t.ask <= 0):
-            raise MT5Error(f"Quote live tidak tersedia untuk '{symbol}' (bid/ask = 0). Cek simbol di Market Watch.")
+        if t is None or t.bid <= 0 or t.ask <= 0 or t.ask < t.bid or int(t.time) <= 0:
+            raise MT5Error(
+                f"Quote live tidak valid untuk '{symbol}' (bid={getattr(t, 'bid', 0)}, "
+                f"ask={getattr(t, 'ask', 0)}, time={getattr(t, 'time', 0)}). "
+                "Cek simbol dan koneksi Market Watch."
+            )
         return {
             "bid": float(t.bid),
             "ask": float(t.ask),
@@ -176,28 +204,29 @@ class MT5Client:
             "spread": float(t.ask - t.bid),
         }
 
-    def fetch_closed_candles(self, symbol: str, timeframe: str, count: int = 400) -> list:
+    def fetch_closed_candles(self, symbol: str, timeframe: str, count: int = 600) -> list:
         """Ambil candle yang SUDAH TUTUP (start_pos=1 melewati bar yang masih berjalan)."""
         tf_const, _ = timeframe_info(timeframe)
         rates = mt5.copy_rates_from_pos(symbol, tf_const, 1, count)
         if rates is None or len(rates) == 0:
             raise MT5Error(f"Gagal mengambil candle {symbol} {timeframe}: {mt5.last_error()}")
-        return [
-            {
-                "ts": int(r["time"]),
+        by_ts = {}
+        for r in rates:
+            ts = int(r["time"])
+            by_ts[ts] = {
+                "ts": ts,
                 "open": float(r["open"]),
                 "high": float(r["high"]),
                 "low": float(r["low"]),
                 "close": float(r["close"]),
                 "volume": float(r["tick_volume"]),
             }
-            for r in rates
-        ]
+        return [by_ts[k] for k in sorted(by_ts)]
 
     def get_open_positions(self, symbol: str, magic: int) -> list:
         rows = mt5.positions_get(symbol=symbol)
         if rows is None:
-            return []
+            raise MT5Error(f"Gagal membaca posisi terbuka '{symbol}': {mt5.last_error()}")
         result = []
         for p in rows:
             if int(p.magic) != magic:
@@ -247,9 +276,10 @@ class MT5Client:
         magic: int,
         deviation: int = 500,
         comment: str = "EA_Riyan_BTC",
+        tick_data: dict = None,
     ) -> dict:
         spec = self.symbol_spec(symbol)
-        t = self.tick(symbol)
+        t = self.tick(symbol) if tick_data is None else _validate_tick_dict(tick_data, symbol)
         is_buy = side.upper() == "BUY"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         price = t["ask"] if is_buy else t["bid"]
@@ -259,17 +289,24 @@ class MT5Client:
         min_dist = spec.stops_level * spec.point
         sl_rounded = round(sl, spec.digits) if sl and sl > 0 else 0.0
         tp_rounded = round(tp, spec.digits) if tp and tp > 0 else 0.0
-        if min_dist > 0:
-            if sl_rounded > 0:
-                if is_buy and (close_ref - sl_rounded) < min_dist:
-                    sl_rounded = round(close_ref - min_dist, spec.digits)
-                elif not is_buy and (sl_rounded - close_ref) < min_dist:
-                    sl_rounded = round(close_ref + min_dist, spec.digits)
-            if tp_rounded > 0:
-                if is_buy and (tp_rounded - close_ref) < min_dist:
-                    tp_rounded = round(close_ref + min_dist, spec.digits)
-                elif not is_buy and (close_ref - tp_rounded) < min_dist:
-                    tp_rounded = round(close_ref - min_dist, spec.digits)
+        sl_distance = close_ref - sl_rounded if is_buy else sl_rounded - close_ref
+        tp_distance = tp_rounded - close_ref if is_buy else close_ref - tp_rounded
+        invalid_stop = (
+            (sl_rounded > 0 and (sl_distance <= 0 or sl_distance < min_dist))
+            or (tp_rounded > 0 and (tp_distance <= 0 or tp_distance < min_dist))
+        )
+        if invalid_stop:
+            return {
+                "ok": False,
+                "retcode": int(getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)),
+                "comment": f"SL/TP terlalu dekat dengan harga penutupan (minimum {min_dist:g})",
+                "order": 0,
+                "deal": 0,
+                "price": price,
+                "volume": float(lot),
+                "sl": sl_rounded,
+                "tp": tp_rounded,
+            }
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -297,6 +334,51 @@ class MT5Client:
             "volume": float(res.volume or lot),
             "sl": sl_rounded,
             "tp": tp_rounded,
+        }
+
+    def modify_position_sl(self, pos: dict, new_sl: float, tick_data: dict = None) -> dict:
+        """Geser SL posisi terbuka (hanya memperketat ke arah profit, hormati stops/freeze level)."""
+        spec = self.symbol_spec(pos["symbol"])
+        t = self.tick(pos["symbol"]) if tick_data is None else _validate_tick_dict(tick_data, pos["symbol"])
+        is_buy = pos["side"] == "BUY"
+        close_ref = t["bid"] if is_buy else t["ask"]
+        sl_rounded = round(float(new_sl), spec.digits)
+        tp_rounded = round(float(pos.get("tp", 0.0) or 0.0), spec.digits)
+        min_dist = max(spec.stops_level, spec.freeze_level) * spec.point
+
+        sl_dist = close_ref - sl_rounded if is_buy else sl_rounded - close_ref
+        if sl_rounded <= 0 or sl_dist <= 0 or sl_dist < min_dist:
+            return {
+                "ok": False,
+                "retcode": int(getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)),
+                "comment": f"SL baru terlalu dekat dengan harga pasar (min {min_dist:g})",
+                "sl": sl_rounded,
+            }
+
+        cur_sl = float(pos.get("sl", 0.0) or 0.0)
+        if cur_sl > 0:
+            if is_buy and sl_rounded <= cur_sl + spec.point * 0.5:
+                return {"ok": False, "retcode": 0, "comment": "SL BUY tidak lebih tinggi dari SL lama", "sl": cur_sl}
+            if not is_buy and sl_rounded >= cur_sl - spec.point * 0.5:
+                return {"ok": False, "retcode": 0, "comment": "SL SELL tidak lebih rendah dari SL lama", "sl": cur_sl}
+
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": pos["symbol"],
+            "position": int(pos["ticket"]),
+            "sl": sl_rounded,
+            "tp": tp_rounded,
+        }
+        res = mt5.order_send(req)
+        if res is None:
+            raise MT5Error(f"order_send SLTP mengembalikan None: {mt5.last_error()}")
+        no_chg = int(getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025))
+        ok = res.retcode in (mt5.TRADE_RETCODE_DONE, no_chg)
+        return {
+            "ok": ok,
+            "retcode": int(res.retcode),
+            "comment": str(res.comment),
+            "sl": sl_rounded,
         }
 
     def close_position(self, pos: dict, magic: int, deviation: int = 500, comment: str = "EA_Close") -> dict:
@@ -331,7 +413,7 @@ class MT5Client:
     def get_closed_deals_since(self, symbol: str, magic: int, since_ts: int) -> list:
         """Ambil deal penutupan (TP/SL/manual) milik bot sejak since_ts."""
         start_dt = datetime.fromtimestamp(max(0, since_ts - 3600), UTC)
-        end_dt = datetime.now(UTC) + timedelta(days=1)
+        end_dt = datetime.now(UTC) + timedelta(days=2)
         deals = mt5.history_deals_get(start_dt, end_dt)
         if not deals:
             return []
